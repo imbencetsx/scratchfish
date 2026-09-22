@@ -172,7 +172,9 @@ class ChessGUI:
         text = self.small_font.render(self.engine.status_text(), True, TEXT)
         self.screen.blit(text, (20, 735))
         bot_text = self.small_font.render(
-            f"Bot: {self.engine.bot_color_name()}", True, TEXT
+            f"Bot: {self.engine.bot_color_name()} ({self.engine.brain_name()})",
+            True,
+            TEXT,
         )
         self.screen.blit(bot_text, (250, 735))
 

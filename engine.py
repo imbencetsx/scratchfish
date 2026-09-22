@@ -1,14 +1,31 @@
-import random
 import chess
+
+from evaluation import evaluate_white_cp
+from neural import WEIGHTS_PATH, evaluate_white_nn, try_load_net
+from search import Searcher
+
 
 class ChessEngine:
     """Owns the game state. The GUI calls into this; it never draws."""
 
-    def __init__(self, bot_is_white: bool = False):
+    def __init__(
+        self,
+        bot_is_white: bool = False,
+        depth: int = 3,
+        time_limit: float = 0.8,
+        use_nn: bool = True,
+    ):
         self.board = chess.Board()
         self.bot_is_white = bot_is_white
         self.game_over = False
+        self.depth = depth
+        self.time_limit = time_limit
 
+        # Neural brain if weights exist, else classical fallback.
+        self.net = try_load_net() if use_nn else None
+        self.use_nn = self.net is not None
+        if use_nn and self.net is None:
+            print(f"No {WEIGHTS_PATH.name} found - using classical eval. Run train.py.")
     # ----------------------------
     # Game control
     # ----------------------------
@@ -53,6 +70,16 @@ class ChessEngine:
     def bot_color_name(self) -> str:
         return "White" if self.bot_is_white else "Black"
 
+    def brain_name(self) -> str:
+        if self.use_nn:
+            return f"NN (depth {self.depth})"
+        return f"classical (depth {self.depth})"
+
+    def _eval_white_cp(self, board: chess.Board) -> int:
+        if self.net is not None:
+            return evaluate_white_nn(self.net, board)
+        return evaluate_white_cp(board)
+
     # ----------------------------
     # Moves
     # ----------------------------
@@ -77,15 +104,17 @@ class ChessEngine:
         return False
 
     def bot_move(self) -> bool:
-        """Temporary random bot. Returns True if a move was played."""
+        """Search-driven bot. Returns True if a move was played."""
         if self.board.is_game_over():
             self.game_over = True
             return False
-        moves = list(self.board.legal_moves)
-        if not moves:
+        move, info = Searcher(
+            self._eval_white_cp, time_limit=self.time_limit
+        ).best_move(self.board, self.depth)
+        if move is None:
             self.game_over = True
             return False
-        self.board.push(random.choice(moves))
+        self.board.push(move)
         if self.board.is_game_over():
             self.game_over = True
         return True

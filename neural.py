@@ -1,145 +1,191 @@
-"""Neural eval: board encoding + MLP (torch).
+"""Compact residual evaluator, with sparse NumPy inference for root move ordering.
 
-Input: 13 planes x 64 squares = 832 floats + 8 aux floats = 840.
-  planes 0-5:  white P N B R Q K
-  planes 6-11: black P N B R Q K
-  plane 12:    side to move (all 1.0 if White to move else 0.0)
-  aux: white-K, white-Q, black-K, black-Q castling rights,
-       side-to-move in check, en-passant available,
-       en-passant file (/7), halfmove clock (/100).
-Output: tanh in [-1, 1], White's perspective (1 = White winning).
-
-Trained in train.py by distilling the classical eval, then improved
-via self-play later. Search (search.py) converts to side-to-move cp.
+Material/position scoring stays exact. The learned correction is bounded to
+200cp, so a small or poorly trained model cannot erase an extra queen.
+The old weights.pt remains available for experiments with the legacy ResNet.
 """
 
 from pathlib import Path
 
 import chess
+import numpy as np
 import torch
 import torch.nn as nn
 
-N_PLANES = 13
-N_SQUARES = 64
-N_AUX = 8
-INPUT_SIZE = N_PLANES * N_SQUARES + N_AUX  # 840
+from evaluation import evaluate_white_cp
 
-WEIGHTS_PATH = Path(__file__).with_name("weights.pt")
+N_PLANES = 20
+BOARD_HW = 8
+N_BLOCKS = 8
+N_FILTERS = 256
+INPUT_SIZE = 12 * 64 + 8
+HIDDEN_SIZE = 64
+RESIDUAL_CP = 200
+WEIGHTS_PATH = Path(__file__).with_name("fast_weights.pt")
+LEGACY_WEIGHTS_PATH = Path(__file__).with_name("weights.pt")
 
-# Order must match planes 0-5 / 6-11.
-_PIECE_ORDER = [
-    chess.PAWN,
-    chess.KNIGHT,
-    chess.BISHOP,
-    chess.ROOK,
-    chess.QUEEN,
-    chess.KING,
-]
+
+def sparse_features(board: chess.Board) -> tuple[list[int], np.ndarray]:
+    indices = []
+    for color in chess.COLORS:
+        for piece in chess.PIECE_TYPES:
+            offset = ((piece - 1) + (0 if color else 6)) * 64
+            indices.extend(offset + sq for sq in chess.scan_forward(board.pieces_mask(piece, color)))
+    aux = np.array([float(board.turn), float(board.is_check()),
+                    float(board.has_kingside_castling_rights(chess.WHITE)),
+                    float(board.has_queenside_castling_rights(chess.WHITE)),
+                    float(board.has_kingside_castling_rights(chess.BLACK)),
+                    float(board.has_queenside_castling_rights(chess.BLACK)),
+                    (board.ep_square + 1) / 64 if board.ep_square is not None else 0,
+                    min(board.halfmove_clock, 100) / 100], dtype=np.float32)
+    return indices, aux
 
 
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
-    """Encode board as flat FloatTensor of shape (840,).
-
-    Squares: index = plane*64 + square. Aux features appended last.
-    """
-    t = torch.zeros(INPUT_SIZE, dtype=torch.float32)
-    for square, piece in board.piece_map().items():
-        plane = _PIECE_ORDER.index(piece.piece_type)
-        if piece.color == chess.BLACK:
-            plane += 6
-        t[plane * N_SQUARES + square] = 1.0
-    if board.turn == chess.WHITE:
-        t[12 * N_SQUARES : 13 * N_SQUARES] = 1.0
-    base = N_PLANES * N_SQUARES
-    t[base + 0] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    t[base + 1] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    t[base + 2] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    t[base + 3] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
-    t[base + 4] = 1.0 if board.is_check() else 0.0
-    t[base + 5] = 1.0 if board.has_legal_en_passant() else 0.0
-    # En-passant file (0-7 normalized) + halfmove clock (/100). Zero when n/a.
-    if board.ep_square is not None:
-        t[base + 6] = chess.square_file(board.ep_square) / 7.0
-    t[base + 7] = min(board.halfmove_clock, 100) / 100.0
-    return t
+    indices, aux = sparse_features(board)
+    values = np.zeros(INPUT_SIZE, dtype=np.float32)
+    values[indices] = 1
+    values[768:] = aux
+    return torch.from_numpy(values)
 
 
 def cp_to_target(cp: int) -> float:
-    """Map teacher centipawns to [-1, 1] training target."""
-    cp = max(-1500, min(1500, cp))
-    return cp / 1500.0
+    """Legacy teacher score mapping; compact training uses residual targets."""
+    return max(-1500, min(1500, cp)) / 1500.0
 
 
 def target_to_cp(score: float) -> int:
-    """Map net output [-1, 1] back to centipawns (White perspective)."""
     return int(max(-1.0, min(1.0, score)) * 1500)
 
 
 class EvalNet(nn.Module):
-    def __init__(self, input_size: int = INPUT_SIZE) -> None:
+    """52k-parameter MLP predicting a bounded correction to classical eval."""
+    def __init__(self):
         super().__init__()
-        self.input_size = input_size
-        self.net = nn.Sequential(
-            nn.Linear(input_size, 1024),
-            nn.LayerNorm(1024),
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Tanh(),
-        )
+        self.input_size = INPUT_SIZE
+        self.net = nn.Sequential(nn.Linear(INPUT_SIZE, HIDDEN_SIZE), nn.ReLU(),
+                                 nn.Linear(HIDDEN_SIZE, 32), nn.ReLU(),
+                                 nn.Linear(32, 1), nn.Tanh())
+        # An untrained model adds zero, preserving the handcrafted baseline.
+        nn.init.zeros_(self.net[4].weight)
+        nn.init.zeros_(self.net[4].bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.net(x)
 
 
-@torch.no_grad()
-def evaluate_white_nn(net: nn.Module, board: chess.Board) -> int:
-    """NN eval in centipawns, White's perspective."""
+class FastEvaluator:
+    """Fold a trained MLP into sparse CPU inference without per-node Torch calls."""
+    def __init__(self, net: EvalNet):
+        layers = [net.net[i] for i in (0, 2, 4)]
+        self.weights = [layer.weight.detach().cpu().numpy().T.copy() for layer in layers]
+        self.biases = [layer.bias.detach().cpu().numpy().copy() for layer in layers]
+
+    def residual(self, board):
+        indices, aux = sparse_features(board)
+        # Sum only occupied piece features (~32), not a dense 776x64 multiply.
+        w0, w1, w2 = self.weights
+        b0, b1, b2 = self.biases
+        x = np.maximum(w0[indices].sum(axis=0) + aux @ w0[768:] + b0, 0)
+        x = np.maximum(x @ w1 + b1, 0)
+        return float(np.tanh(x @ w2 + b2)[0])
+
+    def __call__(self, board):
+        # Color/vertical symmetry prevents a learned preference for one color.
+        correction = (self.residual(board) - self.residual(board.mirror())) * 0.5
+        return evaluate_white_cp(board) + int(RESIDUAL_CP * correction)
+
+
+@torch.inference_mode()
+def evaluate_white_nn(net, board):
+    if isinstance(net, FastEvaluator):
+        return net(board)
+    if isinstance(net, EvalNet):
+        device = next(net.parameters()).device
+        net.eval()
+        boards = [board, board.mirror()]
+        x = torch.stack([board_to_tensor(b) for b in boards]).to(device)
+        scores = net(x).flatten().cpu().tolist()
+        return evaluate_white_cp(board) + int(RESIDUAL_CP * (scores[0] - scores[1]) / 2)
     net.eval()
-    score = net(board_to_tensor(board).unsqueeze(0)).item()
-    return target_to_cp(score)
+    device = next(net.parameters()).device
+    return target_to_cp(net(board_to_planes(board).unsqueeze(0).to(device)).item())
 
 
-@torch.no_grad()
-def evaluate_batch_nn(net: nn.Module, boards: list[chess.Board]) -> list[int]:
-    """Batched NN eval (much faster inside search). Returns cp list."""
-    net.eval()
-    if not boards:
-        return []
-    x = torch.stack([board_to_tensor(b) for b in boards])
-    scores = net(x).squeeze(1).tolist()
-    if isinstance(scores, float):
-        scores = [scores]
-    return [target_to_cp(s) for s in scores]
+def evaluate_batch_nn(net, boards):
+    return [evaluate_white_nn(net, board) for board in boards]
 
 
-def try_load_net(weights: Path = WEIGHTS_PATH) -> EvalNet | None:
-    """Load trained weights. Returns None if missing or shape-mismatched.
+def checkpoint(net, **metadata):
+    return {"format_version": 1, "architecture": "compact-residual-64x32",
+            "state_dict": net.state_dict(), "metadata": metadata}
 
-    Shape mismatch happens after architecture upgrades (e.g. 832 -> 840
-    inputs). In that case we warn and return None so the caller falls back
-    to classical eval until you retrain.
-    """
+
+def try_load_net(weights: Path = WEIGHTS_PATH):
+    weights = Path(weights)
     if not weights.exists():
         return None
     try:
         state = torch.load(weights, map_location="cpu", weights_only=True)
-        first_w = state.get("net.0.weight")
-        if first_w is not None and first_w.shape[1] != INPUT_SIZE:
-            print(
-                f"Weights expect input {first_w.shape[1]}, "
-                f"code wants {INPUT_SIZE} - retrain needed. Run train.py."
-            )
-            return None
-        net = EvalNet()
-        net.load_state_dict(state)
-        net.eval()
-        return net
-    except Exception as e:  # corrupt / partial file
-        print(f"Could not load {weights.name}: {e} - using classical eval.")
+        if state.get("architecture") == "compact-residual-64x32":
+            net = EvalNet()
+            net.load_state_dict(state["state_dict"])
+            net.eval()
+            return FastEvaluator(net)
+        # Explicit legacy loads are supported; gameplay never silently loads the big CNN.
+        if "stem.0.weight" in state:
+            filters = state["stem.0.weight"].shape[0]
+            blocks = len({key.split('.')[1] for key in state if key.startswith("tower.")})
+            net = LegacyEvalNet(blocks=blocks, filters=filters)
+            net.load_state_dict(state)
+            return net.eval()
+        raise ValueError("unrecognized checkpoint architecture")
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        print(f"Could not load {weights.name}: {exc}; using classical evaluation.")
         return None
+
+
+# Legacy encoding and architecture are retained only for explicit old-checkpoint comparisons.
+def board_to_planes(board):
+    values = np.zeros((20, 8, 8), dtype=np.float32)
+    for color in chess.COLORS:
+        for piece in chess.PIECE_TYPES:
+            plane = piece - 1 + (0 if color else 6)
+            for sq in chess.scan_forward(board.pieces_mask(piece, color)):
+                values[plane, 7 - chess.square_rank(sq), chess.square_file(sq)] = 1
+    _, aux = sparse_features(board)
+    for plane, value in zip(range(12, 18), aux[:6]):
+        values[plane] = value
+    if board.ep_square is not None:
+        values[18, 7 - chess.square_rank(board.ep_square), chess.square_file(board.ep_square)] = 1
+    values[19] = aux[7]
+    return torch.from_numpy(values)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, filters=N_FILTERS):
+        super().__init__()
+        self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(filters)
+        self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(filters)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + x)
+
+
+class LegacyEvalNet(nn.Module):
+    def __init__(self, planes=N_PLANES, blocks=N_BLOCKS, filters=N_FILTERS):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(planes, filters, 3, padding=1, bias=False),
+                                  nn.BatchNorm2d(filters), nn.ReLU(inplace=True))
+        self.tower = nn.Sequential(*[ResBlock(filters) for _ in range(blocks)])
+        self.head = nn.Sequential(nn.Conv2d(filters, 32, 1, bias=False),
+                                  nn.BatchNorm2d(32), nn.ReLU(inplace=True), nn.Flatten(),
+                                  nn.Linear(2048, 512), nn.ReLU(inplace=True),
+                                  nn.Linear(512, 256), nn.ReLU(inplace=True),
+                                  nn.Linear(256, 1), nn.Tanh())
+
+    def forward(self, x):
+        return self.head(self.tower(self.stem(x)))

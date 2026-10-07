@@ -11,8 +11,8 @@ class ChessEngine:
     def __init__(
         self,
         bot_is_white: bool = False,
-        depth: int = 3,
-        time_limit: float = 0.8,
+        depth: int = 8,
+        time_limit: float = 0.35,
         use_nn: bool = True,
     ):
         self.board = chess.Board()
@@ -21,11 +21,13 @@ class ChessEngine:
         self.depth = depth
         self.time_limit = time_limit
 
-        # Neural brain if weights exist, else classical fallback.
+        # A compact model guides root ordering; tactical leaves stay inexpensive.
         self.net = try_load_net() if use_nn else None
         self.use_nn = self.net is not None
+        self.last_search_info = {}
         if use_nn and self.net is None:
-            print(f"No {WEIGHTS_PATH.name} found - using classical eval. Run train.py.")
+            print(f"No compact {WEIGHTS_PATH.name} loaded; using classical evaluation.")
+
     # ----------------------------
     # Game control
     # ----------------------------
@@ -33,6 +35,7 @@ class ChessEngine:
     def new_game(self) -> None:
         self.board = chess.Board()
         self.game_over = False
+        self.last_search_info = {}
 
     def switch_side(self) -> None:
         self.bot_is_white = not self.bot_is_white
@@ -55,7 +58,7 @@ class ChessEngine:
     def status_text(self) -> str:
         if self.game_over:
             if self.board.is_checkmate():
-                outcome = self.board.outcome()
+                outcome = self.board.outcome(claim_draw=True)
                 winner = "White" if outcome and outcome.winner else "Black"
                 return f"Checkmate - {winner} wins"
             if self.board.is_stalemate():
@@ -72,8 +75,8 @@ class ChessEngine:
 
     def brain_name(self) -> str:
         if self.use_nn:
-            return f"NN (depth {self.depth})"
-        return f"classical (depth {self.depth})"
+            return f"hybrid ({self.time_limit:g}s)"
+        return f"classical ({self.time_limit:g}s)"
 
     def _eval_white_cp(self, board: chess.Board) -> int:
         if self.net is not None:
@@ -98,23 +101,31 @@ class ChessEngine:
         move = chess.Move(from_square, to_square, promotion=promotion)
         if move in self.board.legal_moves:
             self.board.push(move)
-            if self.board.is_game_over():
+            if self.board.is_game_over(claim_draw=True):
                 self.game_over = True
             return True
         return False
 
-    def bot_move(self) -> bool:
-        """Search-driven bot. Returns True if a move was played."""
-        if self.board.is_game_over():
-            self.game_over = True
-            return False
-        move, info = Searcher(
-            self._eval_white_cp, time_limit=self.time_limit
-        ).best_move(self.board, self.depth)
-        if move is None:
-            self.game_over = True
+    def find_bot_move(self, board: chess.Board, stop_event=None):
+        """Search a private board; safe to call in the GUI worker thread."""
+        return Searcher(evaluate_white_cp, time_limit=self.time_limit,
+                        stop_event=stop_event,
+                        root_eval_white_cp=self._eval_white_cp if self.net is not None else None).best_move(board, self.depth)
+
+    def apply_bot_move(self, move, info) -> bool:
+        """Apply a completed search result on the main thread."""
+        self.last_search_info = info
+        if move is None or move not in self.board.legal_moves:
+            self.game_over = self.board.is_game_over(claim_draw=True)
             return False
         self.board.push(move)
-        if self.board.is_game_over():
-            self.game_over = True
+        self.game_over = self.board.is_game_over(claim_draw=True)
         return True
+
+    def bot_move(self) -> bool:
+        """Search-driven bot. Returns True if a move was played."""
+        if self.board.is_game_over(claim_draw=True):
+            self.game_over = True
+            return False
+        move, info = self.find_bot_move(self.board.copy())
+        return self.apply_bot_move(move, info)

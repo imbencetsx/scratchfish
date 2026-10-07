@@ -1,5 +1,8 @@
 """Pygame GUI: draws the board and handles input. Game rules live in engine.py."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
 import chess
 import pygame
 
@@ -99,6 +102,17 @@ class ChessGUI:
         self.small_font = pygame.font.SysFont("arial", 22)
         self.button_font = pygame.font.SysFont("arial", 20)
         self.clock = pygame.time.Clock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chess-search")
+        self._pending = None
+        self._search_board = None
+        self._stop_search = Event()
+        self._piece_surfaces = {
+            (color, piece): render_with_outline(
+                self.piece_font, glyph,
+                WHITE_PIECE if color else BLACK_PIECE,
+                WHITE_OUTLINE if color else BLACK_OUTLINE)
+            for color in chess.COLORS for piece, glyph in GLYPHS.items()
+        }
 
         self.selected_square: chess.Square | None = None
         self.new_game_rect = pygame.Rect(490, 728, 100, 38)
@@ -138,15 +152,7 @@ class ChessGUI:
             x = file * SQUARE_SIZE + SQUARE_SIZE // 2
             y = (7 - rank) * SQUARE_SIZE + SQUARE_SIZE // 2
 
-            glyph = GLYPHS[piece.piece_type]
-            if piece.color == chess.WHITE:
-                surf = render_with_outline(
-                    self.piece_font, glyph, WHITE_PIECE, WHITE_OUTLINE
-                )
-            else:
-                surf = render_with_outline(
-                    self.piece_font, glyph, BLACK_PIECE, BLACK_OUTLINE
-                )
+            surf = self._piece_surfaces[(piece.color, piece.piece_type)]
             rect = surf.get_rect(center=(x, y))
             self.screen.blit(surf, rect)
 
@@ -194,10 +200,12 @@ class ChessGUI:
     def handle_click(self, pos: tuple[int, int]) -> None:
         x, y = pos
         if self.new_game_rect.collidepoint(x, y):
+            self._stop_search.set()
             self.engine.new_game()
             self.selected_square = None
             return
         if self.switch_rect.collidepoint(x, y):
+            self._stop_search.set()
             self.engine.switch_side()
             self.selected_square = None
             return
@@ -221,25 +229,40 @@ class ChessGUI:
     # Main loop
     # ----------------------------
 
+    def update_bot(self) -> None:
+        """Search copies in a worker; apply moves only to the matching live game."""
+        if self._pending is not None and self._pending.done():
+            move, info = self._pending.result()
+            if self.engine.board is self._search_board and self.engine.bot_turn():
+                self.engine.apply_bot_move(move, info)
+            self._pending = None
+        if self._pending is None and self.engine.bot_turn():
+            self._stop_search = Event()
+            self._search_board = self.engine.board
+            self._pending = self._executor.submit(
+                self.engine.find_bot_move, self.engine.board.copy(), self._stop_search)
+
     def run(self) -> None:
         running = True
-        while running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    self.handle_click(event.pos)
-
-            if not self.engine.game_over and self.engine.bot_turn():
-                self.engine.bot_move()
-
-            self.screen.fill(BACKGROUND)
-            self.draw_board()
-            self.draw_selection()
-            self.draw_pieces()
-            self.draw_status()
-            self.draw_buttons()
-            pygame.display.flip()
-            self.clock.tick(60)
-
-        pygame.quit()
+        try:
+            while running:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        self.handle_click(event.pos)
+                if not running:
+                    break
+                self.update_bot()
+                self.screen.fill(BACKGROUND)
+                self.draw_board()
+                self.draw_selection()
+                self.draw_pieces()
+                self.draw_status()
+                self.draw_buttons()
+                pygame.display.flip()
+                self.clock.tick(60)
+        finally:
+            self._stop_search.set()
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            pygame.quit()

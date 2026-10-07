@@ -265,4 +265,5 @@ class ChessGUI:
         finally:
             self._stop_search.set()
             self._executor.shutdown(wait=True, cancel_futures=True)
+            self.engine.close_log()
             pygame.quit()

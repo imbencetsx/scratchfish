@@ -134,10 +134,14 @@ def _pawn_structure(white_pawns: int, black_pawns: int) -> int:
     return score
 
 
-def evaluate_white_cp(board: chess.Board) -> int:
+def evaluate_white_cp(board: chess.Board, correction_tables=None,
+                      correction_bias=0.0, correction_limit=200, square_tables=None,
+                      king_bonus=None, extra=0) -> int:
     """White centipawns; search handles mate/draws. No neural model is needed."""
     score = _pawn_structure(board.pawns & board.occupied_co[chess.WHITE],
                             board.pawns & board.occupied_co[chess.BLACK])
+    correction = correction_bias
+    square_tables = square_tables if square_tables is not None else _SQUARE_VALUES
     phase = min(24, board.knights.bit_count() + board.bishops.bit_count()
                 + 2 * board.rooks.bit_count() + 4 * board.queens.bit_count())
     pawns = [board.pawns & board.occupied_co[color] for color in chess.COLORS]
@@ -147,10 +151,18 @@ def evaluate_white_cp(board: chess.Board) -> int:
         subtotal = 0
         for piece in chess.PIECE_TYPES:
             mask = board.pieces_mask(piece, color)
-            table = _SQUARE_VALUES[color, piece]
-            if piece == chess.KING:
+            table = square_tables[color, piece]
+            if correction_tables is not None:
+                learned = correction_tables[color, piece]
+                for sq in chess.scan_forward(mask):
+                    subtotal += ((table[sq] * phase + _KING_END[sq] * (24 - phase)) // 24
+                                 if piece == chess.KING else table[sq])
+                    correction += learned[sq]
+            elif piece == chess.KING:
                 for sq in chess.scan_forward(mask):
                     subtotal += (table[sq] * phase + _KING_END[sq] * (24 - phase)) // 24
+                    if king_bonus is not None:
+                        subtotal += king_bonus[color][sq]
             else:
                 subtotal += sum(table[sq] for sq in chess.scan_forward(mask))
         if (board.bishops & ours).bit_count() >= 2:
@@ -174,4 +186,4 @@ def evaluate_white_cp(board: chess.Board) -> int:
             edge = max(abs(chess.square_file(loser) - 3.5), abs(chess.square_rank(loser) - 3.5))
             bonus = int(10 * edge + 8 * (7 - chess.square_distance(wk, bk)))
             score += bonus if score > 0 else -bonus
-    return score + (10 if board.turn else -10)
+    return score + (10 if board.turn else -10) + extra + int(max(-correction_limit, min(correction_limit, correction)))

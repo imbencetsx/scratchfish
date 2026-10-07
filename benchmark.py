@@ -69,15 +69,43 @@ def main():
     parser.add_argument('--sf-path', default='')
     parser.add_argument('--baseline-dir', default='')
     parser.add_argument('--out', default='')
+    parser.add_argument('--checkpoint', type=Path, default=WEIGHTS_PATH)
+    parser.add_argument('--search-mode', choices=['root', 'compiled', 'projected'], default=None)
+    parser.add_argument('--compare-search', type=Path, help='compare a saved previous search.py using the same model')
+    parser.add_argument('--projected', action='store_true', help='also test learned leaf evaluation')
     args = parser.parse_args()
     if args.positions < 1 or args.seconds <= 0:
         parser.error('positions and seconds must be positive')
     torch.set_num_threads(1)
     boards = positions(args.positions, args.seed)
-    net = try_load_net()
+    net = try_load_net(args.checkpoint)
+    search_mode = args.search_mode or getattr(net, 'metadata', {}).get('search_mode', 'root')
+    class GameplaySearch:
+        def __init__(self, evaluator, seconds):
+            self.evaluator, self.seconds = evaluator, seconds
+        def best_move(self, board, depth):
+            leaf = (self.evaluator.for_search(board, search_mode)
+                    if search_mode != 'root' else evaluate_white_cp)
+            return Searcher(leaf, self.seconds, root_eval_white_cp=self.evaluator).best_move(board, depth)
     engines = {'classical': (Searcher, evaluate_white_cp, 8),
-               'hybrid': (lambda evaluator, seconds: Searcher(evaluate_white_cp, seconds,
-                           root_eval_white_cp=evaluator), net or FastEvaluator(EvalNet()), 8)}
+               'hybrid': (GameplaySearch, net or FastEvaluator(EvalNet()), 8)}
+    if args.projected and net:
+        class ProjectedSearch:
+            def __init__(self, evaluator, seconds):
+                self.evaluator, self.seconds = evaluator, seconds
+            def best_move(self, board, depth):
+                return Searcher(self.evaluator.for_search(board, mode='projected'), self.seconds,
+                                root_eval_white_cp=self.evaluator).best_move(board, depth)
+        engines['projected'] = (ProjectedSearch, net, 8)
+        class CompiledSearch(ProjectedSearch):
+            def best_move(self, board, depth):
+                return Searcher(self.evaluator.for_search(board), self.seconds,
+                                root_eval_white_cp=self.evaluator).best_move(board, depth)
+        engines['compiled'] = (CompiledSearch, net, 8)
+    if args.compare_search:
+        previous = load_module('previous_search', args.compare_search)
+        engines['previous_hybrid'] = (lambda evaluator, seconds: previous.Searcher(
+            evaluate_white_cp, seconds, root_eval_white_cp=evaluator), net or FastEvaluator(EvalNet()), 8)
     if args.baseline_dir:
         directory = Path(args.baseline_dir)
         old_search = load_module('baseline_search', directory / 'search.py')
@@ -92,19 +120,15 @@ def main():
     if args.stockfish and sf is None:
         parser.error('Stockfish unavailable; provide --sf-path or omit --stockfish')
     report = {'positions': args.positions, 'seconds': args.seconds, 'seed': args.seed,
-              'checkpoint': WEIGHTS_PATH.name if net else None,
-              'checkpoint_sha256': hashlib.sha256(WEIGHTS_PATH.read_bytes()).hexdigest() if net else None,
+              'checkpoint': str(args.checkpoint) if net else None, 'search_mode': search_mode,
+              'checkpoint_sha256': hashlib.sha256(args.checkpoint.read_bytes()).hexdigest() if net else None,
               'fens': [board.fen() for board in boards], 'engines': {}}
     try:
         if sf:
             sf.configure({'Threads': 1, 'Hash': 64})
-        references = []
-        if sf:
-            for board in boards:
-                score = sf.analyse(board, chess.engine.Limit(depth=14, time=.1))['score'].pov(board.turn)
-                references.append(score.score(mate_score=100_000))
+        chosen_moves = {}
         for name, (search_class, evaluator, depth) in engines.items():
-            elapsed, depths, regrets, corruptions = [], [], [], 0
+            elapsed, depths, corruptions, moves = [], [], 0, []
             for index, original in enumerate(boards):
                 board = original.copy()
                 before, stack = board.fen(), board.move_stack.copy()
@@ -113,25 +137,43 @@ def main():
                 elapsed.append(time.perf_counter() - started)
                 depths.append(info['depth'])
                 corruptions += int(board.fen() != before or board.move_stack != stack)
-                if sf:
-                    if move is None or move not in original.legal_moves:
-                        regrets.append(100_000)
-                    else:
-                        forced = sf.analyse(original, chess.engine.Limit(depth=14, time=.1),
-                                            root_moves=[move])['score'].pov(original.turn)
-                        regrets.append(max(0, references[index] - forced.score(mate_score=100_000)))
+                moves.append(move)
                 if (index + 1) % 6 == 0:
                     print(f'{name}: {index + 1}/{len(boards)} positions', flush=True)
             result = {'mean_move_ms': round(statistics.mean(elapsed) * 1000, 2),
                       'max_move_ms': round(max(elapsed) * 1000, 2),
                       'mean_depth': round(statistics.mean(depths), 2),
                       'board_corruptions': corruptions}
-            if regrets:
-                result.update(mean_loss_cp=round(statistics.mean(regrets), 1),
-                              median_loss_cp=round(statistics.median(regrets), 1),
-                              blunders_200cp=sum(loss >= 200 for loss in regrets))
+            chosen_moves[name] = moves
             report['engines'][name] = result
             print(name, json.dumps(result), flush=True)
+        if sf:
+            losses = {name: [] for name in engines}
+            referee_depths = []
+            for index, board in enumerate(boards):
+                best = sf.play(board, chess.engine.Limit(depth=16, time=.15)).move
+                candidates = {best}
+                candidates.update(moves[index] for moves in chosen_moves.values()
+                                  if moves[index] is not None and moves[index] in board.legal_moves)
+                # Score all candidates together at the same MultiPV horizon, avoiding
+                # different hash histories and depth budgets for each forced move.
+                infos = sf.analyse(board, chess.engine.Limit(depth=16, time=.3),
+                                   root_moves=sorted(candidates, key=lambda move: move.uci()),
+                                   multipv=len(candidates))
+                scores = {info['pv'][0]: info['score'].pov(board.turn).score(mate_score=100_000)
+                          for info in infos if info.get('pv')}
+                reference = max(scores.values())
+                referee_depths.append(min(info.get('depth', 0) for info in infos))
+                for name, moves in chosen_moves.items():
+                    losses[name].append(max(0, reference - scores[moves[index]])
+                                        if moves[index] in scores else 100_000)
+            for name, values in losses.items():
+                report['engines'][name].update(mean_loss_cp=round(statistics.mean(values), 1),
+                                              median_loss_cp=round(statistics.median(values), 1),
+                                              blunders_200cp=sum(value >= 200 for value in values))
+            report['referee'] = {'method': 'shared-candidate-multipv',
+                                 'min_depth': min(referee_depths),
+                                 'mean_depth': round(statistics.mean(referee_depths), 1)}
     finally:
         if sf:
             sf.quit()

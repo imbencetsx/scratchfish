@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from evaluation import evaluate_white_cp
+from evaluation import evaluate_white_cp, _SQUARE_VALUES
 
 N_PLANES = 20
 BOARD_HW = 8
@@ -76,7 +76,8 @@ class EvalNet(nn.Module):
 
 class FastEvaluator:
     """Fold a trained MLP into sparse CPU inference without per-node Torch calls."""
-    def __init__(self, net: EvalNet):
+    def __init__(self, net: EvalNet, metadata=None):
+        self.metadata = metadata or {}
         layers = [net.net[i] for i in (0, 2, 4)]
         self.weights = [layer.weight.detach().cpu().numpy().T.copy() for layer in layers]
         self.biases = [layer.bias.detach().cpu().numpy().copy() for layer in layers]
@@ -90,10 +91,94 @@ class FastEvaluator:
         x = np.maximum(x @ w1 + b1, 0)
         return float(np.tanh(x @ w2 + b2)[0])
 
+    def _gradient(self, board):
+        """Analytic input derivative of the tiny MLP; only computed at the root."""
+        indices, aux = sparse_features(board)
+        w0, w1, w2 = self.weights
+        b0, b1, b2 = self.biases
+        pre0 = w0[indices].sum(axis=0) + aux @ w0[768:] + b0
+        pre1 = np.maximum(pre0, 0) @ w1 + b1
+        score = float(np.tanh(np.maximum(pre1, 0) @ w2 + b2)[0])
+        grad = w0 @ ((pre0 > 0) * (w1 @ ((pre1 > 0) * w2[:, 0])))
+        return score, grad * (1 - score * score)
+
+    def for_search(self, board, mode='compiled'):
+        projected = ProjectedEvaluator(self, board)
+        return projected if mode == 'projected' else CompiledEvaluator(projected)
+
     def __call__(self, board):
         # Color/vertical symmetry prevents a learned preference for one color.
         correction = (self.residual(board) - self.residual(board.mirror())) * 0.5
         return evaluate_white_cp(board) + int(RESIDUAL_CP * correction)
+
+
+class ProjectedEvaluator:
+    """Root-conditioned learned square values, with no neural calls at leaves.
+
+    This is a local linear approximation, not exact NN inference. Build once
+    per move; keep the root fixed for all iterative-deepening passes.
+    """
+    def __init__(self, evaluator, root):
+        score, gradient = evaluator._gradient(root)
+        mirrored_score, mirrored_gradient = evaluator._gradient(root.mirror())
+        mirrored = np.empty(INPUT_SIZE, dtype=np.float32)
+        for plane in range(12):
+            source = (plane + 6) % 12
+            mirrored[plane * 64:(plane + 1) * 64] = mirrored_gradient[
+                source * 64 + (np.arange(64) ^ 56)]
+        mirrored[768:] = mirrored_gradient[[768, 769, 772, 773, 770, 771, 774, 775]]
+        mirrored[768] *= -1  # mirroring flips side-to-move
+        gradient = (gradient - mirrored) * (RESIDUAL_CP / 2)
+        # Ordinal en-passant encoding has no global linear mirror transform.
+        gradient[774] = 0
+        self.aux = tuple(float(value) for value in gradient[768:])
+        self.tables = {
+            (color, piece): tuple(float(value) for value in gradient[
+                ((piece - 1) + (0 if color else 6)) * 64:
+                ((piece - 1) + (0 if color else 6) + 1) * 64])
+            for color in chess.COLORS for piece in chess.PIECE_TYPES
+        }
+        indices, aux = sparse_features(root)
+        self.bias = (score - mirrored_score) * RESIDUAL_CP / 2 - float(
+            gradient[indices].sum() + gradient[768:] @ aux)
+
+    def __call__(self, board):
+        rights = board.clean_castling_rights()
+        values = (float(board.turn), float(board.is_check()),
+                  float(bool(rights & chess.BB_H1)), float(bool(rights & chess.BB_A1)),
+                  float(bool(rights & chess.BB_H8)), float(bool(rights & chess.BB_A8)), 0,
+                  min(board.halfmove_clock, 100) / 100)
+        bias = self.bias + sum(value * weight for value, weight in zip(values, self.aux))
+        return evaluate_white_cp(board, correction_tables=self.tables,
+                                 correction_bias=bias, correction_limit=RESIDUAL_CP)
+
+
+class CompiledEvaluator:
+    """Conservative integer projection fused into the existing square tables.
+
+    Cap learned changes at 2cp per piece/square. Full NN still guides root
+    ordering. Preparation is per root; leaf evaluation uses ordinary Python
+    integer table lookups without a second feature-encoding pass.
+    """
+    def __init__(self, projected):
+        self.tables = {}
+        self.king_bonus = {}
+        for (color, piece), weights in projected.tables.items():
+            sign = 1 if color else -1
+            adjustment = tuple(sign * int(round(max(-2, min(2, value)))) for value in weights)
+            base = _SQUARE_VALUES[color, piece]
+            if piece == chess.KING:
+                self.tables[color, piece] = base
+                self.king_bonus[color] = adjustment
+            else:
+                self.tables[color, piece] = tuple(value + change for value, change in zip(base, adjustment))
+        self.bias = int(round(max(-20, min(20, projected.bias))))
+        self.tempo = int(round(max(-2, min(2, projected.aux[0]))))
+
+    def __call__(self, board):
+        return evaluate_white_cp(board, square_tables=self.tables,
+                                 king_bonus=self.king_bonus,
+                                 extra=self.bias + (self.tempo if board.turn else 0))
 
 
 @torch.inference_mode()
@@ -131,7 +216,7 @@ def try_load_net(weights: Path = WEIGHTS_PATH):
             net = EvalNet()
             net.load_state_dict(state["state_dict"])
             net.eval()
-            return FastEvaluator(net)
+            return FastEvaluator(net, state.get("metadata", {}))
         # Explicit legacy loads are supported; gameplay never silently loads the big CNN.
         if "stem.0.weight" in state:
             filters = state["stem.0.weight"].shape[0]

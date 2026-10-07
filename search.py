@@ -89,7 +89,9 @@ class Searcher:
         history = board.copy()
         self._positions = Counter([_tt_key(history)])
         while history.move_stack:
-            history.pop()
+            previous = history.pop()
+            if history.is_irreversible(previous):
+                break
             self._positions[_tt_key(history)] += 1
         self._repeated = sum(n >= 2 for n in self._positions.values())
         legal = self._ordered(board, board.legal_moves)
@@ -113,11 +115,16 @@ class Searcher:
                 for depth in range(1, max_depth + 1):
                     self._check_time()
                     alpha, candidate = -MATE, best
-                    for move in self._ordered(board, legal, first=best):
+                    for index, move in enumerate(self._ordered(board, legal, first=best)):
                         self._check_time()
                         self._push(board, move)
                         try:
-                            value = -self._negamax(board, depth - 1, -MATE, -alpha, 1)
+                            if index == 0 or depth == 1:
+                                value = -self._negamax(board, depth - 1, -MATE, -alpha, 1)
+                            else:
+                                value = -self._negamax(board, depth - 1, -alpha - 1, -alpha, 1)
+                                if value > alpha:
+                                    value = -self._negamax(board, depth - 1, -MATE, -alpha, 1)
                         finally:
                             self._pop(board)
                         if value > alpha:

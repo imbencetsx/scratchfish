@@ -1,0 +1,8 @@
+{
+  "description": "Local 80-game Stockfish generation throughput check: two rounds of 40 games, full logs disabled. Previous scheduling/settings reconstructed using the current generator. Time-limited Stockfish searches can produce different moves and label counts; this is a throughput check, not a strength comparison.",
+  "hardware": "Development Mac, 10 logical CPUs, Metal available",
+  "settings": {"games_per_round": 40, "rounds": 2, "max_plies": 40, "sample_every": 4, "sf_depth": 12, "sf_ms": 20, "sf_play_ms": 5, "sf_threads": 1},
+  "previous": {"workers": 4, "hash_mib_per_worker": 32, "games_per_chunk": 4, "engine_lifetime": "chunk", "round_seconds": [4.850, 4.137], "samples_per_round": [230, 218], "total_seconds": 9.244},
+  "updated": {"workers": 5, "hash_mib_per_worker": 64, "games_per_chunk": 1, "engine_lifetime": "worker", "round_seconds": [3.488, 2.698], "samples_per_round": [212, 202], "total_seconds": 6.482},
+  "gpu_smoke_test": {"device": "mps", "teacher": "stockfish", "games_per_round": 6, "rounds": 2, "epochs_per_round": 2, "max_plies": 24, "sample_every": 2, "workers": 2, "full_logs": true, "completed": true, "validated_checkpoints_saved": true, "total_seconds": 3.6}
+}

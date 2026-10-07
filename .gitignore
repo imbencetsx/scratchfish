@@ -11,3 +11,8 @@ wheels/
 
 # Generated training datasets
 .training/
+
+# Training sidecar data (model checkpoints remain tracked)
+*.replay.pt
+*.validation.pt
+*.pt.tmp
